@@ -3,6 +3,7 @@ import torch.nn as nn
 import numpy as np
 import json
 import random
+from kafka import KafkaConsumer, KafkaProducer
 
 # ============================================
 # STEP 1: Generate training data (NORMAL patients)
@@ -11,10 +12,10 @@ def generate_normal_training_data(num_samples=500):
     data = []
     for _ in range(num_samples):
         sample = [
-            random.uniform(60, 100),    # heart_rate
-            random.uniform(95, 100),    # spo2
-            random.uniform(110, 130),   # bp_systolic
-            random.uniform(97.0, 99.0)  # temperature
+            random.uniform(60, 100),
+            random.uniform(95, 100),
+            random.uniform(110, 130),
+            random.uniform(97.0, 99.0)
         ]
         data.append(sample)
     return np.array(data, dtype=np.float32)
@@ -25,9 +26,7 @@ def generate_normal_training_data(num_samples=500):
 class LSTMAutoencoder(nn.Module):
     def __init__(self, input_size=4, hidden_size=8):
         super(LSTMAutoencoder, self).__init__()
-        # Encoder - compresses the data
         self.encoder = nn.LSTM(input_size, hidden_size, batch_first=True)
-        # Decoder - reconstructs back to original size
         self.decoder = nn.LSTM(hidden_size, input_size, batch_first=True)
 
     def forward(self, x):
@@ -42,12 +41,10 @@ def train_model():
     print("Generating training data...")
     training_data = generate_normal_training_data(500)
 
-    # Normalize the data
     mean = training_data.mean(axis=0)
     std = training_data.std(axis=0)
     normalized_data = (training_data - mean) / std
 
-    # LSTM expects shape: (batch, sequence_length, features)
     tensor_data = torch.tensor(normalized_data).unsqueeze(1)
 
     model = LSTMAutoencoder(input_size=4, hidden_size=8)
@@ -92,19 +89,44 @@ def check_anomaly(model, mean, std, patient_data, threshold=1.5):
     return is_anomaly, error
 
 # ============================================
-# MAIN - Test the model
+# STEP 5: Live monitoring from Kafka
+# ============================================
+def live_monitor(model, mean, std):
+    consumer = KafkaConsumer(
+        'patient-vitals-processed',
+        bootstrap_servers=['localhost:29092'],
+        auto_offset_reset='latest',
+        value_deserializer=lambda x: json.loads(x.decode('utf-8'))
+    )
+
+    producer = KafkaProducer(
+        bootstrap_servers=['localhost:29092'],
+        value_serializer=lambda x: json.dumps(x).encode('utf-8')
+    )
+
+    print("Live monitoring started - reading from Kafka...\n")
+
+    for message in consumer:
+        patient_data = message.value
+        is_anomaly, error = check_anomaly(model, mean, std, patient_data)
+
+        if is_anomaly:
+            alert = {
+                'patient_id': patient_data['patient_id'],
+                'heart_rate': patient_data['heart_rate'],
+                'spo2': patient_data['spo2'],
+                'reconstruction_error': round(error, 4),
+                'timestamp': patient_data['timestamp'],
+                'severity': 'CRITICAL'
+            }
+            producer.send('alerts', value=alert)
+            print(f"ALERT SENT - {alert}")
+        else:
+            print(f"Normal - {patient_data['patient_id']}: HR={patient_data['heart_rate']}, Error={error:.4f}")
+
+# ============================================
+# MAIN
 # ============================================
 if __name__ == "__main__":
     model, mean, std = train_model()
-
-    test_patients = [
-        {"patient_id": "P001", "heart_rate": 75, "spo2": 98, "bp_systolic": 120, "temperature": 98.2},
-        {"patient_id": "P002", "heart_rate": 145, "spo2": 82, "bp_systolic": 180, "temperature": 103.5},
-        {"patient_id": "P003", "heart_rate": 80, "spo2": 97, "bp_systolic": 125, "temperature": 98.6},
-    ]
-
-    print("Checking test patients:\n")
-    for patient in test_patients:
-        is_anomaly, error = check_anomaly(model, mean, std, patient)
-        status = "ANOMALY" if is_anomaly else "NORMAL"
-        print(f"{status} - {patient['patient_id']}: HR={patient['heart_rate']}, SpO2={patient['spo2']}, Error={error:.4f}")
+    live_monitor(model, mean, std)
